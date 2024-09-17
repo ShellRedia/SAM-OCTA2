@@ -110,6 +110,6 @@ _FAZ_
 
 ## 5.Others 
 
-<!-- If you find this useful, please cite the relevant paper: https://arxiv.org/abs/2309.11758 -->
+If you find this useful, please cite the relevant paper: https://arxiv.org/abs/2409.09286
 
 __Additional notes__： The current paper is under review for conference submission, so more detailed weights and content will be released and added after acceptance.
