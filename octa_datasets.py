@@ -380,7 +380,7 @@ class OCTA_Dataset_SAM2_Single(Dataset):
         elif dataset_name == "ROSE":
             self.sample_ids = list({
                 "train":range(101, 130), 
-                "val":range(131, 132), 
+                "val":range(131, 140), 
                 "test":range(131, 140)}[subset])
 
         self.cached_batch = {}
