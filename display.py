@@ -3,10 +3,12 @@ import cv2
 import math
 import numpy as np
 from PIL import Image
+from skimage import morphology, filters, measure
+from scipy.ndimage import binary_fill_holes, gaussian_filter
 
 class DisplaySequence:
     def __init__(self):
-        self.point_size = 10
+        self.point_size = 15
         self.colors = np.load("color_list.npy").tolist()
 
         alpha = 0.5
@@ -39,24 +41,34 @@ class DisplaySequence:
             display_images.append(colored_mask)
         cv2.imwrite("{}/{}.png".format(self.save_dir, sample_name), np.concatenate(display_images, axis=1))
     
-    def display_a_batch_prediction(self, image_seq, mask_seq, pred_seq, prompts_dct, save_dir="prediction", sample_name="display_image"):
+    def display_a_batch_prediction(self, batch, pred_seq, save_dir="prediction"):
+        sample_name = batch["sample_name"][0]
+        image_seq = batch["images"]
+        mask_seq = batch["masks"]
+        prompts_dct = batch["prompts"]
         os.makedirs(save_dir, exist_ok=True)
 
-        image_seq = image_seq.cpu().numpy().transpose((0,2,3,1))
+        image_seq = image_seq.squeeze(0).cpu().numpy().transpose((0,2,3,1))
 
         num_of_frame, h, w, c = image_seq.shape
 
-        images, gt_images, pred_images, pred_o_images = [], [], [], []
+        images, gt_images, gt_o_images, pred_images, pred_o_images = [], [], [], [], []
 
         for frame_idx in range(num_of_frame):
             image, mask, pred = image_seq[frame_idx], mask_seq[frame_idx], pred_seq[frame_idx]
+
             images.append(image)
 
             gt_colored_mask, pred_colored_mask = np.zeros_like(image), np.zeros_like(image)
             for obj_idx in mask:
                 gt_colored_mask += self.to_color(mask[obj_idx][0].numpy(), self.colors[obj_idx])
+                pred[obj_idx] = morphology.remove_small_objects(pred[obj_idx] , min_size=200)
                 pred_colored_mask += self.to_color(pred[obj_idx], self.colors[obj_idx])
-            # gt_colored_mask = self.overlay(gt_colored_mask, image)
+
+            gt_images.append(gt_colored_mask)
+
+            gt_colored_mask = self.overlay(gt_colored_mask, image)
+            
             pred_colored_mask_overlayed = self.overlay(pred_colored_mask, image)
 
             if frame_idx in prompts_dct:
@@ -68,16 +80,17 @@ class DisplaySequence:
                         # cv2.circle(gt_colored_mask, (int(x), int(y)), self.point_size, point_color, -1)
                         cv2.circle(pred_colored_mask_overlayed, (int(x), int(y)), self.point_size, point_color, -1)
 
-            gt_images.append(gt_colored_mask)
+            gt_o_images.append(gt_colored_mask)
             pred_images.append(pred_colored_mask)
             pred_o_images.append(pred_colored_mask_overlayed)
             
         gt_concat = np.concatenate(gt_images, axis=1)
+        gt_o_concat = np.concatenate(gt_o_images, axis=1)
         pred_concat = np.concatenate(pred_images, axis=1)
         pred_o_concat = np.concatenate(pred_o_images, axis=1)
         images_concat = np.concatenate(images, axis=1)
-        display_image = np.concatenate([gt_concat, pred_concat, pred_o_concat, images_concat], axis=0)
-        cv2.imwrite("{}/{}.png".format(save_dir, sample_name), display_image)
+        display_image = np.concatenate([gt_concat, gt_o_concat, pred_concat, pred_o_concat, images_concat], axis=0)
+        if np.sum(gt_concat): cv2.imwrite("{}/{}.png".format(save_dir, sample_name), display_image)
 
     
     def display_a_frame_prediction(self, image, masks, obj_idxs, prompt_points=[]):
@@ -93,11 +106,35 @@ class DisplaySequence:
         
         return overlay_image
     
+    def display_monai_prediction(self, image, mask, pred, sample_id, sample_save_dir="prediction"):
+        image, mask, pred = image.numpy(), mask.numpy(), pred.numpy()
+        if image.shape[0] == mask.shape[0]:
+            flatten = lambda x: np.concatenate(x, axis=1)
+            image, mask, pred = map(flatten, [image, mask, pred])
+        else:
+            image = np.transpose(image, (1,2,0))
+            mask = cv2.merge([mask[0].astype(np.uint8)]*3)
+            pred = cv2.merge([pred[0].astype(np.uint8)]*3)
+
+        sample_image = np.concatenate([image, mask, pred], axis=0) * 255
+        cv2.imwrite("{}/{}.png".format(sample_save_dir, sample_id), sample_image)
+
+    
     def convert_cv2_to_PIL(self, cv_image):
         cv_image_rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
         return Image.fromarray(cv_image_rgb)
     
     def make_gif(self, frames, save_path):
         frames = [self.convert_cv2_to_PIL(x) for x in frames]
-        frames[0].save(save_path, format='GIF', append_images=frames[1:], save_all=True, duration=100, loop=0)                    
+        frames[0].save(save_path, format='GIF', append_images=frames[1:], save_all=True, duration=100, loop=0)
 
+    def smooth_mask(self, mask):
+        # remove small components and fulfill holes
+        labeled_image = measure.label(mask)
+        cleaned_image = morphology.remove_small_objects(labeled_image, min_size=50)
+        filled_image = binary_fill_holes(cleaned_image).astype(np.uint8)
+
+        smoothed_image_gauss = gaussian_filter(filled_image.astype(float), sigma=5)
+        smoothed_image_gauss = smoothed_image_gauss > filters.threshold_otsu(smoothed_image_gauss)
+        
+        return smoothed_image_gauss

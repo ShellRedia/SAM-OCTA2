@@ -1,90 +1,79 @@
 # SAM-OCTA2
 
-
 ## 1. 写在开头
 
 __SAM-OCTA2__ 是关于 __SAM-OCTA__ 在层序扫描下的拓展分割方法，因为 __OCTA__ 以及其他很多类型的医学图像样本是通过层序扫描后堆叠起来的，本质上可视作三维的, 所以形式上是可以和视频的目标分割相对应。
 
-__注意__：这次的训练所需的显存相当大，我在把序列长度设置为8帧的时候，基本上是把A100的80G都跑满了，如果只是测试应该会宽松一些（总之需要有一定准备，，嗯）。
+由于有投期刊论文的需要，我重构了部分代码，尤其是微调部分，总结而言就是大量节省了显存。原因简单而言，实际就是取消了主干网部分梯度图的保存。因此也能够支持 __large__ 尺寸模型的微调了。经过这次重构，性能不仅大幅提升，并且可用性也大大增强了。
 
-![Sample](./figures/memory_usage.png)
+首先，您应该将一个预训练的权重文件放入 __pretrained_weights__ 文件夹中。预训练权重的下载链接如下:
 
-<sub>这里我想稍微废话几句自己对于三维数据的标注的看法。首先这很难通过使用例如 __Blender__ 这样的三维软件直接标注，尽管这种方法可以有很直观的可视化效果，通过不同视角的反复比对可以达到相当的精度。目前很多方法使用的就是层序标注，无论如何，纯粹的人工标注也会有相当大的工作量</sub>
+large(default): https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt
 
-本项目的工作总体而言可分为两个部分，是对于 SAM-OCTA2 的微调以及关于OCTA这一特殊数据模态的处理。实话说，由于工作量属实不小，前后弄完已经比较忙乱，所以我也没有去好好总结应该如何去装环境和依赖，建议把几个主要的文件跑一下，根据警告来pip install。
-
-首先，您应该将一个预训练的权重文件放入 **sam2_weights** 文件夹中。预训练权重的下载链接如下:
-
-base_plus (default): https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_base_plus.pt
-
-large: https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt
+base_plus: https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_base_plus.pt
 
 small: https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_small.pt
 
 tiny: https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_tiny.pt
 
-__base_plus__ 是默认使用的，如果您需要使用其他尺寸的模型，请下载对应权重，并在 __options.py__ 中修改对应配置项：
+__large__ 是默认使用的，如果您需要使用其他尺寸的模型，请下载对应权重，并在 __options.py__ 中修改对应配置项：
 
     ...
-    parser.add_argument("-model_type", type=str, default="base_plus")
+    parser.add_argument("-model_type", type=str, default="large")
     ...
 
 ## 2. 关于微调
 
-使用 **train_sam_octa2.py** 来开始进行微调。
+使用 __train_sam_octa2.py__ 来开始进行微调。
 
     python train_sam_octa2.py
 
-这里我使用了 __OCTA-500__ 中的几个样本作为一个示例，如果需要完整的数据集，需要联系 __OCTA-500__ 数据集的作者。
+这里我使用了 __OCTA-500__、 __ROSE__ 以及 __Soul__ 数据集中的几个样本作为一个示例，如果需要完整的数据集，需要联系他们的作者。
 
 __OCTA-500__ 的相关论文: https://arxiv.org/abs/2012.07261
 
-首先将OCTA-500原有的数据集按照这个路径原样放置：
+__ROSE__ 的相关论文: https://ieeexplore.ieee.org/document/9284503
 
-![Sample](./figures/octa500_data_path.png)
+__Soul__ 的相关论文: https://www.nature.com/articles/s41597-024-03665-7
 
-### 2.1. 层序分割
+数据集的路径需要按照任务的类型进行放置：
 
-__RV__（视网膜血管（簇））:
+![Sample](./figures/dataset_placement_1.png)
+![Sample](./figures/dataset_placement_2.png)
 
-RV样本的图像和标注是分开的，原因是要先标记出每根血管所属，图像中的同一根血管可能因为层切分拆为两部分。标注的路径配置如下，这个文件夹的标注文件是经过 __utils.py__ 中的 __mark_rv_objects__ 方法得到的。
+分割的类型分为序列和单张(en-face 投影分割)，进行微调前需要在 __options.py__ 文件中进行配置类型的调整确认。
 
-![Sample](./figures/RV_layer_sequence_annotation.png)
+    ...
+    parser.add_argument("--dataset", type=str, default="3M")
+    parser.add_argument("--data_type", type=str, default="sequence") 
+    parser.add_argument("--label_type", type=str, default="Artery")
+    parser.add_argument("--is_local", type=str, default="Local")
+    ...
 
-样本路径配置如图，有用的是后两张图，前面的是血管区域的mask。
+示例结果和分割指标将被记录在 __results__ 文件夹中（如果不存在，则这个文件夹将被自动创建）。
 
-![Sample](./figures/RV_layer_sequence_sample.png)
-
-__FAZ__（中心无血管区）:
-
-FAZ样本配置的路径如图，层图像样本是将三张图拼接在一起的。有用的图像是后两张，第一张只是用来看预览效果的，本项目中并没有被模型使用。
-
-![Sample](./figures/FAZ_layer_sequence_sample.png)
-
-
-示例结果和分割指标将被记录在 **results** 文件夹中（如果不存在，则这个文件夹将被自动创建）。
-
-这是一些带有提示点的分割的示例，从左到右分别是输入图像、标注以及预测结果。
-
-### 2.2 en-face 投影分割
-
-对于常见的en-face投影分割任务，SAM-OCTA2也可完成，但是需要重新微调，样本路径配置如图。这里我将所有的用到的图像并排合成为一张，以便预览。
-
-![Sample](./figures/RV_projection_sample.png)
+注意，期刊版本相较于会议版本进行了一些修改，仅使用了正提示点（因为负提示点的作用有限）。弱化了提示点对于单张（en-face投影）图像分割的滥用，增强其实用性，使其更接近于端到端的模型。
 
 ## 3. 稀疏标注
 
-稀疏标注的目的是利用现有成熟的分割模型辅助标注，训练代码和预测代码：
+稀疏标注的目的是利用现有成熟的分割模型（例如DiNTS），对 __OCTA-500__ 数据集进行辅助层序标注，训练和gradio前端手动标注与预测代码分别如下：
 
-__sparse_annotation_rv_training.py__ 和 __sparse_annotation_rv_prediction.py__
+训练: __sparse_annotation_train.py__
 
-训练数据集的路径和命名规则如图所示：
+前端手动标注\预测: __sparse_annotation_predict.py__
 
-![Sample](./figures/sparse_annotation_sample.png)
+关于稀疏标注的模型训练这部分，针对OCTA-500数据集的血管区域处理也许并非必要，其价值更多体现在流程方面，可以此参考进行改进。
 
-需要预测的层序图像放在这个路径：
+首先需要手动指定体积数据的路径，在我的实现中，是将层序图像堆叠为.npy文件后放在了路径 __datasets/Sparse/OCTA-500/sample__ 下。标注好的图像则存放在路径 __datasets/Sparse/OCTA-500/sam2_region__ 中，以待DiNTS模型读取训练。
 
-![Sample](./figures/sparse_annotation_prediction.png)
+![Sample](./figures/sparse_annotation_gradio.png)
+
+手动标注一些样本后，可通过DiNTS模型进行训练，权重保存于 __pretrained_weights/dints_region.pth__ 。然后返回 __gradio__ 标注界面，可对剩余的样本进行预测以及编辑。
+
+
+我已经把稀疏标注的样本放在百度网盘里，之后更多的权重数据，应该也会放在这个网盘文件夹：
+
+链接: https://pan.baidu.com/s/1hZAWdUC5vm3SngudR5n6gw?pwd=jdxb 提取码: jdxb 
 
 ## 4. 分割效果预览
 
@@ -111,6 +100,4 @@ _FAZ_
 
 ## 5.其他
 
-如果觉得有用请引用相关论文: https://arxiv.org/abs/2409.09286
-
-__另外的说明__： 当前的论文正在投稿会议审稿中，因此更详细的权重或内容将在中稿后公布和增加。
+如果觉得有用请引用相关论文（会议版）: https://ieeexplore.ieee.org/abstract/document/10888853

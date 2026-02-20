@@ -2,7 +2,6 @@ from torch.utils.data import Dataset
 import os
 import cv2
 import numpy as np
-import albumentations as alb
 
 from scipy.ndimage import label, center_of_mass
 
@@ -11,10 +10,14 @@ from skimage.measure import regionprops
 
 from collections import Counter
 
-from random import randint, sample, choice
+import random
+from random import randint, choice, shuffle
+
 from tqdm import tqdm
 
 from prompts import PromptGeneration
+import imgaug.augmenters as iaa
+
 from display import DisplaySequence
 
 
@@ -61,482 +64,466 @@ class OCTA_Dataset_Layer_Sparse_Annotation_Prediction(Dataset):
 
         return process(image), self.sample_identifiers[index]
     
+class ShuffleChannels(iaa.meta.Augmenter):
+    def __init__(self, name=None, random_state=None):
+        super().__init__(name=name, random_state=random_state)
 
-class OCTA_Dataset_SAM2_Training(Dataset):
-    def __init__(self, validation_mode=False, fov="3M", label_type="RV"):
-        self.validation_mode = validation_mode
+    def _augment_images(self, images, random_state, parents, hooks):
+        return [image[..., random_state.permutation(image.shape[-1])] for image in images]
+
+    def get_parameters(self):
+        return []
+    
+class RandomChannelToThree(iaa.meta.Augmenter):
+    def __init__(self, name=None, random_state=None):
+        super().__init__(name=name, random_state=random_state)
+
+    def _augment_images(self, images, random_state, parents, hooks):
+        augmented_images = []
+        for image in images:
+            channel = random_state.randint(0, image.shape[-1])
+            augmented_image = np.stack([image[..., channel]] * 3, axis=-1)
+            augmented_images.append(augmented_image)
+        return augmented_images
+
+    def get_parameters(self):
+        return []
+    
+seq = iaa.Sequential([
+    iaa.Fliplr(0.1), # horizontal flips
+    iaa.Flipud(0.1), # vertical flips
+    iaa.Sometimes(0.1, iaa.GaussianBlur(sigma=(0, 1))),
+    iaa.Sometimes(0.1, iaa.LinearContrast((0.75, 1.5))),
+    iaa.Sometimes(0.1, iaa.AdditiveGaussianNoise(loc=0, scale=(0.0, 0.05*255), per_channel=0.5)),
+    iaa.Sometimes(0.1, iaa.Rotate(rotate=(-10, 10), mode='constant')),
+    iaa.Sometimes(0.1, iaa.Sharpen((0.0, 0.5))),
+    iaa.Sometimes(0.1, iaa.ElasticTransformation(sigma=15)),
+    iaa.Sometimes(0.1, iaa.ImpulseNoise(p=0.05)),
+    iaa.Sometimes(0.1, iaa.Dropout([0.05, 0.2])),
+    iaa.Sometimes(0.1, ShuffleChannels()),
+    iaa.Sometimes(0.1, RandomChannelToThree()),
+], random_order=True) # apply augmenters in random order
+
+# seq = iaa.Sequential([
+#     iaa.Sometimes(0.1, iaa.GaussianBlur(sigma=(0, 1))),
+#     iaa.Sometimes(0.1, iaa.LinearContrast((0.75, 1.5))),
+#     # iaa.Sometimes(0.1, iaa.AdditiveGaussianNoise(loc=0, scale=(0.0, 0.05*255), per_channel=0.5)),
+#     iaa.Sometimes(0.1, iaa.Rotate(rotate=(-10, 10), mode='constant')),
+#     iaa.Sometimes(0.1, iaa.Sharpen((0.0, 0.5))),
+#     # iaa.Sometimes(0.1, iaa.ElasticTransformation(sigma=15)),
+#     iaa.Sometimes(0.1, iaa.ImpulseNoise(p=0.05)),
+# ], random_order=True) # apply augmenters in random order
+
+def data_augmentation(image, mask):
+    to_3ch = lambda x: np.array([x,x,x]).transpose((1,2,0)).astype(dtype=np.uint8)
+    is_image_2ch, is_mask_2ch = bool(len(image.shape) == 2), bool(len(mask.shape) == 2)
+    if is_image_2ch: image = to_3ch(image)
+    if is_mask_2ch: mask = to_3ch(mask)
+    images, masks = np.expand_dims(image, axis=0), np.expand_dims(mask, axis=0)
+    images_aug, masks_aug = seq(images=images, segmentation_maps=masks)
+    images_aug, masks_aug = images_aug[0], masks_aug[0]
+    if is_image_2ch: images_aug = images_aug[:,:,0]
+    if is_mask_2ch: masks_aug = masks_aug[:,:,0]
+    return images_aug, masks_aug
+
+class OCTA_Dataset_SAM2_Sequence(Dataset):
+    def __init__(self, 
+                 dataset_name="3M", 
+                 label_type="RV", 
+                 subset="train", 
+                 frame_length=5, 
+                 prompt_frames=2, 
+                 prompt_num=2,
+                 is_local=True,
+                 prompt_type="point"
+                ):
+        self.dataset_name = "OCTA-500" if dataset_name == "3M" or dataset_name == "6M" else dataset_name
         self.label_type = label_type
-
-        self.valid_batch_dct = {}
+        self.subset = subset
+        self.frame_length = frame_length
+        self.prompt_frames = prompt_frames
+        self.prompt_num = prompt_num
+        self.is_local = is_local
+        self.prompt_type = prompt_type
         
-        self.load_sequence = self.load_sequence_rv
-        if label_type == "FAZ": self.load_sequence = self.load_sequence_faz
+        if dataset_name == "3M":
+            self.sample_ids = list({
+                "train":range(10301, 10441),
+                "val":range(10441, 10451),
+                "test":range(10451, 10501)}[subset])
+        elif dataset_name == "6M": 
+            self.sample_ids = list({
+                "train":range(10001, 10181),
+                "val":range(10181, 10201), 
+                "test":range(10201, 10301)}[subset])
+        elif dataset_name == "Soul":
+            self.sample_ids = list({
+                "train":range(101, 128), 
+                "val":range(128, 135), 
+                "test":range(128, 135)}[subset])
+
+        self.sample_objs = [] # list for -> (sample_id, obj_id)
         
+        self.sample_seq_dct = {}
+        self.sample_obj_color = {}
+        self.sample_obj_neg_colors = {}
 
-        self.layer_root_dir = "datasets/OCTA500/{}_LayerSequence".format(label_type)
-        self.colored_rv_dir = "datasets/OCTA500/Colored_RV"
-        
-        self.sample_names = sorted(os.listdir(self.layer_root_dir))
+        for sample_id in self.sample_ids: self.get_objects_by_sample_id(sample_id)
 
-        subset = set(range(10001, 10181)) if fov == "6M" else set(range(10301, 10441))
-
-        self.pg = PromptGeneration(random_seed=0, neg_range=(3, 9))
-
-        if validation_mode:
-            subset = set(range(10181, 10201)) if fov == "6M" else set(range(10441, 10451))
-            self.pg = PromptGeneration(random_seed=42, neg_range=(3, 9))
-        
-        self.sample_names = [x for x in self.sample_names if int(x) in subset]
-
-        self.select_intervaled_sequence = lambda layer_sequence, n : np.array(layer_sequence)[np.linspace(0, len(layer_sequence)-1, n, dtype=int)]
-        self.get_layer_sequence = lambda sample_name : sorted([x for x in os.listdir("{}/{}".format(self.layer_root_dir, sample_name)) if ".png" in x])
+        random_seed = 0 if subset=="train" else 42
+        self.pg = PromptGeneration(random_seed=random_seed)
+        self.cached_batch = {}
 
         self.to_3ch = lambda x: np.array([x,x,x]).transpose((1,2,0)).astype(dtype=np.uint8)
 
-        probability = 0.5
-        self.transform = alb.Compose([
-            alb.SafeRotate(limit=10, p=probability),
-            alb.HorizontalFlip(p=probability),
-        ])
+    def get_objects_by_sample_id(self, sample_id):
+        region_dir = "Local" if self.is_local else "Global"
+        sample_path = "/".join([self.dataset_name, region_dir, self.label_type, str(sample_id)])
+        sample_path = "datasets/Sequence/{}.png".format(sample_path)
+
+        if os.path.exists(sample_path):
+            sample_seq_image = cv2.imread(sample_path)
+            self.sample_seq_dct[sample_id] = sample_seq_image
+
+            h = sample_seq_image.shape[0]
+            pixels = sample_seq_image[h//2:].reshape(-1, 3)
+            non_black = pixels[~np.all(pixels == [0, 0, 0], axis=1)]
+            unique_colors = np.unique(non_black, axis=0)
+
+            self.sample_obj_neg_colors[sample_id] = unique_colors
+
+            for object_idx, color in enumerate(unique_colors):
+                self.sample_objs.append((sample_id, object_idx))
+                self.sample_obj_color[(sample_id, object_idx)] = color
     
+    def get_empty_prompt(self, object_id=0):
+        xd, yd = {"RV":(1, -1), "FAZ":(-1, 1), "Artery":(-1,-1), "Vein":(1, 1)}[self.label_type]
+        fixed_coord = [xd * 50 + 100, yd * 50 + 100]
+        return {0:{object_id:{"points":np.array([fixed_coord], dtype=np.float32),
+                              "labels":np.array([1], dtype=np.int32)}}}
     
-    def random_crop_sequence(self, layer_sequence, n):
-        beg = randint(0, len(layer_sequence) - n + 1)
-        return layer_sequence[beg:beg + n]
-    
-    def load_sequence_rv(self, sample_name, selected_layer_sequence, prompt_idxs):
-        sample_dir = "{}/{}".format(self.layer_root_dir, sample_name)
+    def octa_data_augmentation(self, sample_seq):
+        augmented_sample_seq = []
+        for image, mask in sample_seq:
+            augmented_sample_seq.append(data_augmentation(image, mask))
+        return augmented_sample_seq
+
+    def load_sequence(self, sample_id, object_id):
+        sample_seq_image = self.sample_seq_dct[sample_id]
+        obj_color = self.sample_obj_color[(sample_id, object_id)]
+        neg_colors = self.sample_obj_neg_colors[sample_id]
+
+        h, w = sample_seq_image.shape[:2]
+        sz = h // 2
+        seq_len = w // sz
 
         target_size = (1024, 1024)
 
-        image_seq, mask_seq, layer_mask_seq = [], [], []
+        layer_sequence = [sample_seq_image[:, i*sz:(i+1)*sz] for i in range(seq_len)]
 
-        proposal_objects = set()
+        if self.subset == "train":
+            if self.dataset_name == "Soul":
+                frame_length = randint(3, seq_len)
+            elif self.dataset_name == "OCTA-500":
+                frame_length = randint(4, seq_len)
 
-        for idx in prompt_idxs:
-            layer_name = selected_layer_sequence[idx][:-4]
-            sample_objects = np.load("{}/{}/objects.npy".format(sample_dir, layer_name))
-            proposal_objects |= set(sample_objects.tolist())
+            num_of_prompt_frames = randint(1, min(3, frame_length))
+
+            start = randint(0, len(layer_sequence) - frame_length)
+            selected_layer_sequence = layer_sequence[start:start + frame_length]
+
+            selected_layer_sequence = [(x[:sz], x[sz:]) for x in selected_layer_sequence]
+            selected_layer_sequence = self.octa_data_augmentation(selected_layer_sequence)
+        else:
+            num_of_prompt_frames = self.prompt_frames
+            if self.label_type == "FAZ":
+                start = (len(layer_sequence) - self.frame_length) // 2
+                selected_layer_sequence = layer_sequence[start : start + self.frame_length]
+            else:
+                selected_layer_sequence = layer_sequence[:self.frame_length] # self.frame_length, self.prompt_frames
+
+            selected_layer_sequence = [(x[:sz], x[sz:]) for x in selected_layer_sequence]
+
+        layer_image_seq = [x[0] for x in selected_layer_sequence]
+        layer_mask_seq = [x[1] for x in selected_layer_sequence]
+
+        # get_prompt_frame_idxs
+        prompt_frame_idxs = []
+        for i, mask in enumerate(layer_mask_seq):
+            if np.any(np.all(mask==obj_color, axis=-1)):
+                prompt_frame_idxs.append(i)
         
-        object_id = choice(list(proposal_objects))
+        prompt_idxs = {
+            0:[],
+            1:[0], 
+            2:[0, len(prompt_frame_idxs)-1], 
+            3:[0, len(prompt_frame_idxs) // 2, len(prompt_frame_idxs)-1]
+        }[min(len(prompt_frame_idxs), num_of_prompt_frames)]
+
+        prompt_idxs = [prompt_frame_idxs[i] for i in prompt_idxs]
+
+        if self.is_local:
+            layer_mask_seq_pos = [np.all(x == obj_color, axis=-1).astype(np.uint8) * 255 for x in layer_mask_seq]
+        else:
+            layer_mask_seq_pos = [np.all(x != np.zeros(3, int), axis=-1).astype(np.uint8) * 255 for x in layer_mask_seq]
+            prompt_idxs = prompt_idxs[:1]
+
+        layer_mask_seq_neg = []
+
+        for x in layer_mask_seq:
+            neg_canvas = np.zeros_like(layer_mask_seq_pos[0], dtype=np.uint8)
+            for color in neg_colors:
+                if not np.array_equal(color, obj_color):
+                    neg_canvas += np.all(x == color, axis=-1)
+            layer_mask_seq_neg.append(np.where(neg_canvas > 0, 255, 0).astype(np.uint8))
         
-        sequence_len = len(selected_layer_sequence)
 
-        for frame_idx, layer_file in enumerate(selected_layer_sequence):
-            layer_name = layer_file[:-4]
-            layer_image = cv2.imread("{}/{}".format(sample_dir, layer_file), cv2.IMREAD_GRAYSCALE)
-            _, w = layer_image.shape
-            layer_image = cv2.resize(layer_image[:,3*w//4:], target_size)
-            layer_mask = np.zeros(target_size)
+        image_lst, layer_mask_lst, neg_layer_mask_lst = np.array(layer_image_seq), np.array(layer_mask_seq_pos), np.array(layer_mask_seq_neg)
 
-            layer_mask_path = "{}/{}/{:0>2}.png".format(sample_dir, layer_name, object_id)
-            if os.path.exists(layer_mask_path):
-                layer_mask = cv2.imread(layer_mask_path, cv2.IMREAD_GRAYSCALE)
-                layer_mask = cv2.resize(layer_mask, target_size)
-
-            layer_mask_seq.append(layer_mask)
-            image_seq.append(layer_image)
-
-        image_seq = np.array(image_seq).transpose((1,2,0))
-        layer_mask_seq = np.array(layer_mask_seq).transpose((1,2,0))
-
-        if not self.validation_mode:
-            transformed = self.transform(**{"image": image_seq, "mask": layer_mask_seq})
-            image_seq, layer_mask_seq = transformed["image"], transformed["mask"]
-
-        image_lst, layer_mask_lst = image_seq.transpose((2,0,1)), layer_mask_seq.transpose((2,0,1))
-
-        image_seq = []
-
-        prompts_dct = {}
+        image_seq, mask_seq, prompts_dct = [], [], {}
             
-        for frame_idx in range(sequence_len):  
-            layer_mask = layer_mask_lst[frame_idx]
-            layer_image = image_lst[frame_idx]
-            image_seq.append(self.to_3ch(layer_image))
+        for frame_idx in range(len(image_lst)):  
+            layer_image, layer_mask, layer_neg_mask = image_lst[frame_idx], layer_mask_lst[frame_idx], neg_layer_mask_lst[frame_idx]
+
+            layer_image = cv2.resize(layer_image, target_size)
+            layer_mask = cv2.resize(layer_mask, target_size)
+            layer_neg_mask = cv2.resize(layer_neg_mask, target_size)
+
+            layer_mask = np.where(layer_mask > 0, 255, 0)
+            layer_neg_mask = np.where(layer_neg_mask > 0, 255, 0)
+
+            image_seq.append(layer_image)
 
             if frame_idx in prompt_idxs and np.sum(layer_mask) > 0:
                 prompts_dct[frame_idx] = {}
                 prompts_dct[frame_idx][object_id] = {}
-                ppp, ppn = randint(1, 10), randint(0, 6)
+ 
+                prompt_num = randint(1, 4) if self.subset == "train" else self.prompt_num
 
-                negative_region = self.pg.search_negative_region_numpy(layer_mask)
+                coord_pos = self.pg.get_prompt_points(layer_mask, prompt_num)
+                # coord_neg = self.pg.get_prompt_points(layer_neg_mask, 1)
 
-                coord_positive = [[y, x] for x, y in np.argwhere(layer_mask > 0)]
-                coord_negative = [[y, x] for x, y in np.argwhere(negative_region > 0)]
+                if self.is_local:
+                    prompts_dct[frame_idx][object_id]["points"] = np.array(coord_pos, dtype=np.float32)
+                    prompts_dct[frame_idx][object_id]["labels"] = np.array([1] * len(coord_pos), dtype=np.int32)
+                    # prompts_dct[frame_idx][object_id]["points"] = np.array(coord_pos + coord_neg, dtype=np.float32)
+                    # prompts_dct[frame_idx][object_id]["labels"] = np.array([1] * len(coord_pos) + [0] * len(coord_neg), dtype=np.int32)
+                else:
+                    xd, yd = {"RV":(1, -1), "FAZ":(-1, 1), "Artery":(-1,-1), "Vein":(1, 1)}[self.label_type]
+                    fixed_coord = [xd * 50 + 100, yd * 50 + 100]
+                    prompts_dct[frame_idx][object_id]["points"] = np.array([fixed_coord], dtype=np.float32)
+                    prompts_dct[frame_idx][object_id]["labels"] = np.array([1], dtype=np.int32)
 
-                prompts_dct[frame_idx][object_id]["points"] = self.pg.sample_points_from_regions(coord_positive, ppp)
-                prompts_dct[frame_idx][object_id]["points"] += self.pg.sample_points_from_regions(coord_negative, ppn)
-
-                prompts_dct[frame_idx][object_id]["labels"] = [1] * ppp + [0] * ppn
-
-                # convert to correct numpy type
-                prompts_dct[frame_idx][object_id]["points"] = np.array(prompts_dct[frame_idx][object_id]["points"], dtype=np.float32)
-                prompts_dct[frame_idx][object_id]["labels"] = np.array(prompts_dct[frame_idx][object_id]["labels"], dtype=np.int32)
-            
             mask_seq.append({object_id:layer_mask / 255})
 
         image_seq = np.array(image_seq)
 
-        return image_seq, mask_seq, prompts_dct
-    
-    def load_sequence_faz(self, sample_name, selected_layer_sequence, prompt_idxs):
-        sample_dir = "{}/{}".format(self.layer_root_dir, sample_name)
+        if not prompts_dct: 
+            prompts_dct = self.get_empty_prompt(object_id)
 
-        target_size = (1024, 1024)
-
-        image_seq, mask_seq, layer_mask_seq = [], [], []
-
-        sequence_len = len(selected_layer_sequence)
-
-        for frame_idx, layer_file in enumerate(selected_layer_sequence):
-            layer_image_concat = cv2.imread("{}/{}".format(sample_dir, layer_file), cv2.IMREAD_GRAYSCALE)
-            _, w = layer_image_concat.shape
-     
-            layer_image = cv2.resize(layer_image_concat[:, w//3:2*w//3], target_size)
-            layer_mask = cv2.resize(layer_image_concat[:, 2*w//3:], target_size)
-
-            layer_mask_seq.append(layer_mask)
-            image_seq.append(layer_image)
-
-        image_seq = np.array(image_seq).transpose((1,2,0))
-        layer_mask_seq = np.array(layer_mask_seq).transpose((1,2,0))
-
-        if not self.validation_mode:
-            transformed = self.transform(**{"image": image_seq, "mask": layer_mask_seq})
-            image_seq, layer_mask_seq = transformed["image"], transformed["mask"]
-
-        image_lst, layer_mask_lst = image_seq.transpose((2,0,1)), layer_mask_seq.transpose((2,0,1))
-
-        image_seq = []
-
-        prompts_dct = {}
-
-        object_id = 0
-            
-        for frame_idx in range(sequence_len):  
-            layer_mask = layer_mask_lst[frame_idx]
-            layer_image = image_lst[frame_idx]
-            image_seq.append(self.to_3ch(layer_image))
-
-            if frame_idx in prompt_idxs and np.sum(layer_mask) > 0:
-                prompts_dct[frame_idx] = {}
-                prompts_dct[frame_idx][object_id] = {}
-                ppp, ppn = randint(1, 10), randint(0, 6)
-
-                coord_positive, coord_negative = self.pg.get_prompt_points(layer_mask, ppp, ppn)
-
-                prompts_dct[frame_idx][object_id]["points"] = coord_positive
-                prompts_dct[frame_idx][object_id]["points"] += coord_negative 
-
-                prompts_dct[frame_idx][object_id]["labels"] = [1] * ppp + [0] * ppn
-
-                # convert to correct numpy type
-                prompts_dct[frame_idx][object_id]["points"] = np.array(prompts_dct[frame_idx][object_id]["points"], dtype=np.float32)
-                prompts_dct[frame_idx][object_id]["labels"] = np.array(prompts_dct[frame_idx][object_id]["labels"], dtype=np.int32)
-            
-            mask_seq.append({object_id:layer_mask / 255})
-
-        image_seq = np.array(image_seq)
 
         return image_seq, mask_seq, prompts_dct
  
     def __len__(self):
-        return len(self.sample_names)
+        return len(self.sample_objs)
     
     def __getitem__(self, index):
         # prompts_lst -> coords(x, y), pos/neg, object_id: [x, y, 1/0, 0...n], four elements tuple
-        sample_name = self.sample_names[index]
-
-        if sample_name in self.valid_batch_dct and self.validation_mode:
-            return self.valid_batch_dct[sample_name]
+        sample_id, object_id = self.sample_objs[index]
+        image_seq, mask_dct_seq, prompts_dct = self.load_sequence(sample_id, object_id)
         
-        layer_sequence = self.get_layer_sequence(sample_name)
+        # format batch
+        sample_name = "{}_{:0>2}".format(sample_id, object_id)
 
-        training_frame_length, num_of_prompt_frames = randint(4, 8), randint(1, 3)
+        if sample_name in self.cached_batch:
+            batch = self.cached_batch[sample_name]
+        else:
+            image_seq = np.array(image_seq).transpose((0,3,1,2))
+            mask_seq = mask_dct_seq
 
-        cropped_layer_sequence = self.random_crop_sequence(layer_sequence, randint(training_frame_length, len(layer_sequence)))
-        selected_layer_sequence = self.select_intervaled_sequence(cropped_layer_sequence, training_frame_length)
-
-        prompt_idxs = {1:[0], 2:[0, training_frame_length-1], 3:[0, training_frame_length // 2, training_frame_length-1]}[num_of_prompt_frames]
-        image_seq, mask_dct_seq, prompts_dct = self.load_sequence(sample_name, selected_layer_sequence, prompt_idxs)
-
-        # Crop out several frames of video ...
-        image_seq = np.array(image_seq).transpose((0,3,1,2))
-        mask_seq = mask_dct_seq
-
-        batch = {
-            "sample_name": sample_name,
-            "images": image_seq,
-            "masks": mask_seq,
-            "prompts": prompts_dct
-        }
-
-        if self.validation_mode: 
-            self.valid_batch_dct[sample_name] = batch
-
-        return batch
-
-class OCTA_Dataset_SAM2_Evaluation(Dataset):
-    def __init__(self, fov="3M", label_type="RV", frame_length=4, num_of_prompt_frames=1, positive_points=1, negative_points=0):
-        self.label_type = label_type
-        self.frame_length = frame_length
-        self.num_of_prompt_frames = num_of_prompt_frames
-        self.ppp = positive_points
-        self.ppn = negative_points
-
-        self.load_sequence = self.load_sequence_rv
-        if label_type == "FAZ": self.load_sequence = self.load_sequence_faz
-
-        self.layer_root_dir = "datasets/OCTA500/{}_LayerSequence".format(label_type)
-        self.colored_rv_dir = "datasets/OCTA500/Colored_RV"
-
-        subset = set(range(10451, 10501)) if fov == "3M" else set(range(10201, 10301))
-
-        colors = [tuple(x) for x in np.load("color_list.npy")]
-        self.colors_dct = dict(zip(colors, range(len(colors))))
-
-        self.pg = PromptGeneration(random_seed=42, neg_range=(3, 9))
-
-        self.select_intervaled_sequence = lambda layer_sequence, n : np.array(layer_sequence)[np.linspace(0, len(layer_sequence)-1, n, dtype=int)]
-        self.get_layer_sequence = lambda sample_name : sorted([x for x in os.listdir("{}/{}".format(self.layer_root_dir, sample_name)) if ".png" in x])
-
-        self.to_3ch = lambda x: np.array([x,x,x]).transpose((1,2,0)).astype(dtype=np.uint8)
-
-        self.batch_dct_lst = []
-
-        sample_names = sorted([x for x in os.listdir(self.layer_root_dir) if int(x) in subset])
-
-        for sample_name in tqdm(sample_names):
-            self.load_batches_of_sample(sample_name)
-    
-    def load_batches_of_sample(self, sample_name):
-        layer_sequence = self.get_layer_sequence(sample_name)
-
-        selected_layer_sequence = self.select_intervaled_sequence(layer_sequence, self.frame_length)
-        prompt_idxs = {1:[0], 2:[0, self.frame_length-1], 3:[0, self.frame_length // 2, self.frame_length-1]}[self.num_of_prompt_frames]
-
-        sample_dir = "{}/{}".format(self.layer_root_dir, sample_name)
-        
-        proposal_objects = [0]
-        if self.label_type == "RV":
-            proposal_objects = set()
-            for idx in prompt_idxs:
-                layer_name = selected_layer_sequence[idx][:-4]
-                sample_objects = np.load("{}/{}/objects.npy".format(sample_dir, layer_name))
-                proposal_objects |= set(sample_objects.tolist())
-        
-        for object_id in proposal_objects:
-            image_seq, mask_dct_seq, prompts_dct = self.load_sequence(sample_name, selected_layer_sequence, prompt_idxs, object_id)
-
-            batch_dct = {
+            batch = {
                 "sample_name": sample_name,
-                "images": np.array(image_seq).transpose((0,3,1,2)),
-                "masks": mask_dct_seq,
+                "images": image_seq,
+                "masks": mask_seq,
                 "prompts": prompts_dct
             }
 
-            self.batch_dct_lst.append(batch_dct)
-    
-    def load_sequence_rv(self, sample_name, selected_layer_sequence, prompt_idxs, object_id):
-        sample_dir = "{}/{}".format(self.layer_root_dir, sample_name)
+            if self.subset != "train": self.cached_batch[sample_name] = batch
 
-        target_size = (1024, 1024)
-
-        image_seq, mask_seq = [], []
-
-        prompts_dct = {}
-
-        for frame_idx, layer_file in enumerate(selected_layer_sequence):
-            layer_name = layer_file[:-4]
-            layer_image = cv2.imread("{}/{}".format(sample_dir, layer_file), cv2.IMREAD_COLOR)
-            _, w, _ = layer_image.shape
-            layer_image = cv2.resize(layer_image[:,3*w//4:], target_size)
-            layer_mask = np.zeros(target_size)
-
-            layer_mask_path = "{}/{}/{:0>2}.png".format(sample_dir, layer_name, object_id)
-            if os.path.exists(layer_mask_path):
-                layer_mask = cv2.imread(layer_mask_path, cv2.IMREAD_GRAYSCALE)
-                layer_mask = cv2.resize(layer_mask, target_size)
-            
-            if frame_idx in prompt_idxs and np.sum(layer_mask) > 0:
-                prompts_dct[frame_idx] = {}
-                prompts_dct[frame_idx][object_id] = {}
-
-                coord_positive, coord_negative = self.pg.get_prompt_points(layer_mask, self.ppp, self.ppn)
-
-                prompts_dct[frame_idx][object_id]["points"] = coord_positive
-                prompts_dct[frame_idx][object_id]["points"] += coord_negative
-
-                prompts_dct[frame_idx][object_id]["labels"] = [1] * self.ppp + [0] * self.ppn
-
-                # convert to correct numpy type
-                prompts_dct[frame_idx][object_id]["points"] = np.array(prompts_dct[frame_idx][object_id]["points"], dtype=np.float32)
-                prompts_dct[frame_idx][object_id]["labels"] = np.array(prompts_dct[frame_idx][object_id]["labels"], dtype=np.int32)
-
-            image_seq.append(layer_image)
-            mask_seq.append({object_id:layer_mask / 255})
-
-        return image_seq, mask_seq, prompts_dct
-
-    def load_sequence_faz(self, sample_name, selected_layer_sequence, prompt_idxs, object_id=0):
-        sample_dir = "{}/{}".format(self.layer_root_dir, sample_name)
-
-        target_size = (1024, 1024)
-
-        image_seq, mask_seq = [], []
-
-        prompts_dct = {}
+        return batch
 
 
-        for frame_idx, layer_file in enumerate(selected_layer_sequence):
-            layer_image_concat = cv2.imread("{}/{}".format(sample_dir, layer_file), cv2.IMREAD_GRAYSCALE)
-            _, w = layer_image_concat.shape
-     
-            layer_image = cv2.resize(layer_image_concat[:, w//3:2*w//3], target_size)
-            layer_mask = cv2.resize(layer_image_concat[:, 2*w//3:], target_size)
-
-            if frame_idx in prompt_idxs and np.sum(layer_mask) > 0:
-                prompts_dct[frame_idx] = {}
-                prompts_dct[frame_idx][object_id] = {}
-
-                coord_positive, coord_negative = self.pg.get_prompt_points(layer_mask, self.ppp, self.ppn)
-
-                prompts_dct[frame_idx][object_id]["points"] = coord_positive
-                prompts_dct[frame_idx][object_id]["points"] += coord_negative
-
-                prompts_dct[frame_idx][object_id]["labels"] = [1] * self.ppp + [0] * self.ppn
-
-                # convert to correct numpy type
-                prompts_dct[frame_idx][object_id]["points"] = np.array(prompts_dct[frame_idx][object_id]["points"], dtype=np.float32)
-                prompts_dct[frame_idx][object_id]["labels"] = np.array(prompts_dct[frame_idx][object_id]["labels"], dtype=np.int32)
-
-            image_seq.append(self.to_3ch(layer_image))
-            mask_seq.append({object_id:layer_mask / 255})
-
-        return image_seq, mask_seq, prompts_dct
-
-
-    def __len__(self):
-        return len(self.batch_dct_lst)
-
-    def __getitem__(self, index):
-        return self.batch_dct_lst[index]
-
-class OCTA_Dataset_SAM2_Projection(Dataset):
-    def __init__(self, subset_name="Training", fov="3M", label_type="RV"):
-        self.subset_name = subset_name
+class OCTA_Dataset_SAM2_Single(Dataset):
+    def __init__(self,
+                 dataset_name="3M", 
+                 label_type="RV",
+                 subset="train",
+                 prompt_num=2,
+                 is_local=True
+                ):
+        self.dataset_name = "OCTA-500" if dataset_name == "3M" or dataset_name == "6M" else dataset_name
         self.label_type = label_type
-
-        self.valid_batch_dct = {}
-
-        self.data_dir = "datasets/OCTA500/ProjectionSamples"
-    
-        colors = [tuple(x) for x in np.load("color_list.npy")]
-        self.colors_dct = dict(zip(colors, range(len(colors))))
+        self.subset = subset
+        self.prompt_num = prompt_num
+        self.is_local = is_local
         
-        self.sample_names = sorted([x[:-4] for x in os.listdir(self.data_dir)])
+        if dataset_name == "3M":
+            self.sample_ids = list({
+                "train":range(10301, 10441),
+                "val":range(10441, 10451), 
+                "test":range(10451, 10501)}[subset])
+        elif dataset_name == "6M": 
+            self.sample_ids = list({
+                "train":range(10001, 10181),
+                "val":range(10181, 10201), 
+                "test":range(10201, 10301)}[subset])
+        elif dataset_name == "ROSE":
+            self.sample_ids = list({
+                "train":range(101, 130), 
+                "val":range(131, 132), 
+                "test":range(131, 140)}[subset])
 
-        subset = set(list(range(10001, 10181))) if fov == "6M" else set(list(range(10301, 10441)))
-
-        if subset_name=="Validation":
-            subset = set(list(range(10181, 10201))) if fov == "6M" else set(list(range(10441, 10451)))
-        elif subset_name=="Test":
-            subset = set(list(range(10201, 10301))) if fov == "6M" else set(list(range(10451, 10501)))
-        
-        self.sample_names = [x for x in self.sample_names if int(x) in subset]
-
+        self.cached_batch = {}
         self.to_3ch = lambda x: np.array([x,x,x]).transpose((1,2,0)).astype(dtype=np.uint8)
 
-        probability = 0.5
-        self.transform = alb.Compose([
-            alb.RandomBrightnessContrast(p=probability),
-            alb.SafeRotate(limit=15, p=probability),
-            alb.HorizontalFlip(p=probability),
-            alb.AdvancedBlur(p=probability)
-        ])
-    def find_nearest_pixel(sefl, binary_image, input_coord):
-        ones_coords = np.argwhere(binary_image == 1)
-        distances = np.linalg.norm(ones_coords - input_coord, axis=1)
-        nearest_index = np.argmin(distances)
-        nearest_coord = ones_coords[nearest_index]
-        return nearest_coord
-    
-    def load_sequence(self, sample_name):
-        sample_image = cv2.imread("{}/{}.png".format(self.data_dir, sample_name), cv2.IMREAD_GRAYSCALE)
-        _, w = sample_image.shape
+    def load_sample(self, sample_id):
+        sample_file = "/".join([self.dataset_name, self.label_type, str(sample_id)])
+        sample_file = "datasets/Single/{}.png".format(sample_file)
+        sample_image = cv2.imread(sample_file, cv2.IMREAD_COLOR)
+        h, w = sample_image.shape[:2]
+        image, mask = sample_image[:, :h], sample_image[:, h:]
 
-        layer_1 = sample_image[:, :w//5]
-        layer_2 = sample_image[:, w//5:2*w//5]
-        layer_3 = sample_image[:, 2*w//5:3*w//5]
+        target_size = (1024, 1024)
+        image = cv2.resize(image, target_size)
+        mask = cv2.resize(mask, target_size)
 
-        image = np.array([layer_1, layer_2, layer_3]).transpose((1,2,0))
+        if self.subset == "train": image, mask = data_augmentation(image, mask)
 
-        mask = sample_image[:,-2*w//5:-w//5]
-        if self.label_type == "FAZ": mask = sample_image[:,-w//5:]
-
-        if self.subset_name == "Training":
-            transformed = self.transform(**{"image": image, "mask": mask})
-            image, mask = transformed["image"], transformed["mask"]
+        image_seq = np.expand_dims(image.transpose((2,0,1)), axis=0)
+        mask = np.where(mask > 0, 1, 0)
+        mask_seq = [{0: mask[:,:,0]}]
         
-        object_id = 0
-        layer_1, layer_2, layer_3 = image[:,:,0], image[:,:,1], image[:,:,2]
-        layer_1, layer_2, layer_3 = map(self.to_3ch, [layer_1, layer_2, layer_3])
-
-        image_seq = np.array([layer_1, layer_2, layer_3])
-        mask_seq = [{object_id:mask / 255}] * 3
-
-        prompts_dct = {}
-        binary_image = mask.astype(np.uint8)
-        binary_image[binary_image >= 1] = 1
-        labeled_image, num_features = label(binary_image)
-        centroids = center_of_mass(binary_image, labeled_image, range(1, num_features + 1))
-        centroids = [self.find_nearest_pixel(binary_image, p) for p in centroids]
-        prompt_points = [(y, x) for (x, y) in centroids]
-
-        if self.label_type == "FAZ":
-            eroded_img = binary_image - cv2.erode(binary_image, np.ones((7, 7), np.uint8), iterations=1)
-            prompt_points += sample([[y, x] for x, y in np.argwhere(eroded_img == 1)], 3)
-
-            
-        for frame_idx in range(3):
-            prompts_dct[frame_idx] = {}
-            prompts_dct[frame_idx][object_id] = {}
-    
-            prompts_dct[frame_idx][object_id]["points"] = prompt_points
-            prompts_dct[frame_idx][object_id]["labels"] = [1] * len(prompt_points)
-
-            prompts_dct[frame_idx][object_id]["points"] = np.array(prompts_dct[frame_idx][object_id]["points"], dtype=np.float32)
-            prompts_dct[frame_idx][object_id]["labels"] = np.array(prompts_dct[frame_idx][object_id]["labels"], dtype=np.int32)
-
-        image_seq = np.array(image_seq)
-
+        if self.is_local:
+            pass
+        else:
+            prompts_dct = {0:{0:{"points":np.array([[100, 100]], dtype=np.float32),
+                                "labels":np.array([1], dtype=np.int32)}}}
+        
         return image_seq, mask_seq, prompts_dct
- 
+    
     def __len__(self):
-        return len(self.sample_names)
+        return len(self.sample_ids)
     
     def __getitem__(self, index):
         # prompts_lst -> coords(x, y), pos/neg, object_id: [x, y, 1/0, 0...n], four elements tuple
-        sample_name = self.sample_names[index]
+        sample_id = self.sample_ids[index]
 
-        if sample_name in self.valid_batch_dct and self.subset_name != "Training":
-            return self.valid_batch_dct[sample_name]
+        image_seq, mask_dct_seq, prompts_dct = self.load_sample(sample_id)
+
+        if sample_id in self.cached_batch:
+            batch = self.cached_batch[sample_id]
+        else:
+            mask_seq = mask_dct_seq
+
+            batch = {
+                "sample_name": sample_id,
+                "images": image_seq,
+                "masks": mask_seq,
+                "prompts": prompts_dct
+            }
+
+            if self.subset != "train": self.cached_batch[sample_id] = batch
+
+        return batch
+
+class OCTA_Dataset_monai(Dataset):
+    def __init__(self,
+                dataset_name="3M", 
+                label_type="RV", 
+                data_type="Sequence",
+                subset="train", 
+                frame_length=8):
+        self.dataset_name = "OCTA-500" if dataset_name == "3M" or dataset_name == "6M" else dataset_name
+        self.label_type = label_type
+        self.data_type = data_type
+        self.subset = subset
+        self.frame_length = frame_length
         
-        image_seq, mask_dct_seq, prompts_dct = self.load_sequence(sample_name)
-        image_seq = np.array(image_seq).transpose((0,3,1,2))
-        mask_seq = mask_dct_seq
+        if dataset_name == "3M":
+            self.sample_ids = list({"train":list(range(10301, 10441)),
+                                     "val":range(10441, 10451), "test":range(10451, 10501)}[subset])
+        elif dataset_name == "6M": 
+            self.sample_ids = list({"train":list(range(10001, 10181)),
+                                     "val":range(10181, 10201), "test":range(10201, 10301)}[subset])
+        elif dataset_name == "ROSE":
+            self.sample_ids = list({"train":range(101, 130), "val":range(131, 140), "test":range(131, 140)}[subset])
 
-        batch = {
-            "sample_name": sample_name,
-            "images": image_seq,
-            "masks": mask_seq,
-            "prompts": prompts_dct
-        }
+        elif dataset_name == "Soul":
+            self.sample_ids = list({"train":range(101, 128), "val":range(128, 129), "test":range(128, 135)}[subset])
 
-        if self.subset_name != "Training": self.valid_batch_dct[sample_name] = batch
+        self.load_sample = {
+            "single":self.load_sample_single,
+            "sequence":self.load_sample_sequence
+        }[data_type]
+    
+    def load_sample_single(self, sample_id):
+        sample_file = "datasets/Single/{}/{}/{}.png".format(self.dataset_name, self.label_type, sample_id)
 
-        return batch       
+        sample_image = cv2.imread(sample_file, cv2.IMREAD_COLOR)
+        h, w = sample_image.shape[:2]
+        image, mask = sample_image[:, :h], sample_image[:, h:]
+
+        target_size = (1024, 1024)
+        image = cv2.resize(image, target_size)
+        mask = cv2.resize(mask, target_size)
+
+        if self.subset == "train": image, mask = data_augmentation(image, mask)
+
+        image = image.transpose((2,0,1)) / 255
+        mask = np.where(mask > 0, 1, 0)[:,:,:1].transpose((2,0,1))
+
+        return image, mask
+
+    def load_sample_sequence(self, sample_id):
+        sample_file = "datasets/{}/{}_global/{}.png".format(self.dataset_name, self.label_type, sample_id)
+
+        sample_image = cv2.imread(sample_file, cv2.IMREAD_GRAYSCALE)
+        
+        h, w = sample_image.shape[:2]
+        sz = h // 2
+        
+        sample_seq = sample_image[:, :sz*self.frame_length]
+
+        frame_len = min(self.frame_length, w // sz)
+
+        sample_seq = [(sample_seq[:sz, i*sz:(i+1)*sz], sample_seq[sz:, i*sz:(i+1)*sz]) for i in range(frame_len)]
+
+        resize = lambda x: cv2.resize(x, (1024, 1024))
+ 
+        sample_seq = [(resize(x),resize(y)) for x, y in sample_seq]
+
+        while len(sample_seq) < self.frame_length:
+            sample_seq.append((np.zeros((1024, 1024), dtype=np.uint8), np.zeros((1024, 1024), dtype=np.uint8)))
+
+        if self.subset == "train": 
+            sample_seq = [data_augmentation(x, y) for x, y in sample_seq]
+
+        image = np.dstack([x[0] for x in sample_seq]).transpose((2,0,1)) / 255
+        mask = np.dstack([x[1] for x in sample_seq]).transpose((2,0,1))
+        mask = np.where(mask > 0, 1, 0)
+
+        
+
+        return image, mask
+
+    def __len__(self):
+        return len(self.sample_ids)
+    
+    def __getitem__(self, index):
+        sample_id = self.sample_ids[index]
+        image, mask = self.load_sample(sample_id)
+        return image, mask, sample_id
+
 
 # if __name__=="__main__":
 #     pass
