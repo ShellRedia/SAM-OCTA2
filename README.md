@@ -6,7 +6,7 @@
 
 __SAM-OCTA2__ is an extended segmentation method based on __SAM-OCTA__ designed for sequential scanning. Since __OCTA__ and many other types of medical image samples are formed by stacking sequential scans and can be essentially viewed as three-dimensional, they formally correspond to video object segmentation.
 
-Due to the need for a journal paper submission, I have refactored parts of the code, especially the fine-tuning section. In summary, this significantly saves GPU memory (VRAM). Simply put, the storage of gradient maps for the backbone network has been eliminated. Consequently, this now supports the fine-tuning of __large__ size models. Through this refactoring, not only has performance improved substantially, but usability has also been greatly enhanced.
+Due to the need for a journal paper submission, I have refactored parts of the code, especially the fine-tuning section. In summary, this significantly saves GPU memory (VRAM). Simply put, the storage of gradient maps for the backbone network has been eliminated. Consequently, this now supports the fine-tuning of __large__ size models. Through this refactoring, not only has performance improved substantially, but usability has also been greatly enhanced. However, the more VRAM the better. I’m using an 80GB A100.
 
 First, you should place a pre-trained weight file into the __pretrained_weights__ folder. The download links for pre-trained weights are as follows:
 
