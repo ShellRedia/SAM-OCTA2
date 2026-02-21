@@ -386,6 +386,9 @@ class OCTA_Dataset_SAM2_Single(Dataset):
         self.cached_batch = {}
         self.to_3ch = lambda x: np.array([x,x,x]).transpose((1,2,0)).astype(dtype=np.uint8)
 
+        random_seed = 0 if subset=="train" else 42
+        self.pg = PromptGeneration(random_seed=random_seed)
+
     def load_sample(self, sample_id):
         sample_file = "/".join([self.dataset_name, self.label_type, str(sample_id)])
         sample_file = "datasets/Single/{}.png".format(sample_file)
